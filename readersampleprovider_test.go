@@ -644,3 +644,125 @@ func buildH265PacketTrailerSEI(meta FrameMetadata) []byte {
 	nal = append(nal, userData...)
 	return nal
 }
+
+// ---------------------------------------------------------------------------
+// H264 length-prefixed stream with LKTS user timestamps: samples must be
+// stamped with the capture time so the track sends them without pacing.
+// ---------------------------------------------------------------------------
+
+func buildH264PacketTrailerSEI(meta FrameMetadata) []byte {
+	nal := []byte{0x06}
+	trailer := appendPacketTrailer(nil, meta)
+	userData := append(packetTrailerSEIUUID[:], trailer...)
+	nal = append(nal, 0x05, byte(len(userData)))
+	return append(nal, userData...)
+}
+
+func lengthPrefixed(nals ...[]byte) []byte {
+	var out []byte
+	for _, n := range nals {
+		var hdr [4]byte
+		binary.BigEndian.PutUint32(hdr[:], uint32(len(n)))
+		out = append(out, hdr[:]...)
+		out = append(out, n...)
+	}
+	return out
+}
+
+func TestH264NextSample_LengthPrefixed_StampsCaptureTime(t *testing.T) {
+	const captureUs = uint64(1_789_415_400_033_333)
+	sps := []byte{0x67, 0x42, 0x00, 0x1E}
+	pps := []byte{0x68, 0xCE, 0x38, 0x80}
+	idr := []byte{0x65, 0x88, 0x84, 0x00}
+	aud := []byte{0x09, 0xF0}
+	stream := lengthPrefixed(
+		buildH264PacketTrailerSEI(FrameMetadata{UserTimestamp: captureUs, FrameId: 5}),
+		sps, pps, idr, aud,
+	)
+
+	newProvider := func(pace bool) *ReaderSampleProvider {
+		return &ReaderSampleProvider{
+			Mime:                webrtc.MimeTypeH264,
+			reader:              io.NopCloser(bytes.NewReader(stream)),
+			h26xStreamingFormat: H26xStreamingFormatLengthPrefixed,
+			appendPacketTrailer: true,
+			paceOnUserTimestamp: pace,
+		}
+	}
+
+	t.Run("stamps every NAL of the access unit", func(t *testing.T) {
+		p := newProvider(true)
+		require.NoError(t, p.OnBind())
+		want := time.UnixMicro(int64(captureUs))
+
+		sei, err := p.NextSample(context.Background())
+		require.NoError(t, err)
+		require.Nil(t, sei.Data)
+		require.Equal(t, want, sei.Timestamp, "SEI placeholder carries the capture time too")
+
+		for _, name := range []string{"sps", "pps"} {
+			s, err := p.NextSample(context.Background())
+			require.NoError(t, err, name)
+			require.Equal(t, want, s.Timestamp, name)
+			require.Zero(t, s.Duration, name)
+		}
+
+		frame, err := p.NextSample(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, want, frame.Timestamp)
+		require.Equal(t, defaultH264FrameDuration, frame.Duration)
+		meta, ok := parsePacketTrailer(frame.Data)
+		require.True(t, ok)
+		require.Equal(t, captureUs, meta.UserTimestamp)
+		require.Equal(t, uint32(5), meta.FrameId)
+
+		// The AUD that closes the access unit keeps the frame's capture time.
+		trailing, err := p.NextSample(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, aud, trailing.Data)
+		require.Equal(t, want, trailing.Timestamp)
+	})
+
+	t.Run("leaves samples unstamped when pacing is disabled", func(t *testing.T) {
+		p := newProvider(false)
+		require.NoError(t, p.OnBind())
+		for i := 0; i < 5; i++ {
+			s, err := p.NextSample(context.Background())
+			require.NoError(t, err)
+			require.True(t, s.Timestamp.IsZero())
+		}
+	})
+}
+
+func TestH264NextSample_CaptureStampedDurationFollowsSource(t *testing.T) {
+	// A 10 fps source: frame durations must come from the capture-time
+	// deltas (100 ms), not from the default 33 ms or an explicit FrameDuration.
+	idr := []byte{0x65, 0x88, 0x84, 0x00}
+	slice := []byte{0x41, 0x9A, 0x00}
+	base := uint64(1_789_415_400_000_000)
+	stream := lengthPrefixed(
+		buildH264PacketTrailerSEI(FrameMetadata{UserTimestamp: base, FrameId: 1}), idr,
+		buildH264PacketTrailerSEI(FrameMetadata{UserTimestamp: base + 100_000, FrameId: 2}), slice,
+		buildH264PacketTrailerSEI(FrameMetadata{UserTimestamp: base + 200_000, FrameId: 3}), slice,
+	)
+	p := &ReaderSampleProvider{
+		Mime:                webrtc.MimeTypeH264,
+		reader:              io.NopCloser(bytes.NewReader(stream)),
+		h26xStreamingFormat: H26xStreamingFormatLengthPrefixed,
+		appendPacketTrailer: true,
+		paceOnUserTimestamp: true,
+		FrameDuration:       33 * time.Millisecond,
+	}
+	require.NoError(t, p.OnBind())
+
+	var durations []time.Duration
+	for i := 0; i < 6; i++ {
+		s, err := p.NextSample(context.Background())
+		require.NoError(t, err)
+		if s.Data != nil {
+			durations = append(durations, s.Duration)
+		}
+	}
+	// First frame has no predecessor: keeps the configured duration.
+	require.Equal(t, []time.Duration{33 * time.Millisecond, 100 * time.Millisecond, 100 * time.Millisecond}, durations)
+}

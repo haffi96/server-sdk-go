@@ -661,6 +661,7 @@ func (s *LocalTrack) writeWorker(provider SampleProvider, onComplete func()) {
 	audioProvider, isAudioProvider := provider.(AudioSampleProvider)
 
 	nextSampleTime := time.Now()
+	var lastLatencyLog, lastCaptureStamp time.Time
 
 	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()
@@ -676,6 +677,19 @@ func (s *LocalTrack) writeWorker(provider SampleProvider, onComplete func()) {
 			return
 		}
 
+		// A provider may stamp samples with their capture time (e.g. from an
+		// LKTS packet trailer). Unstamped samples that follow a stamped one
+		// (SEI placeholders, SPS/PPS) reuse the last capture time so the
+		// track's timeline never jumps to wall-clock "now" and back.
+		providerStamped := !sample.Timestamp.IsZero()
+		if providerStamped {
+			lastCaptureStamp = sample.Timestamp
+		} else if !lastCaptureStamp.IsZero() {
+			sample.Timestamp = lastCaptureStamp
+		} else {
+			sample.Timestamp = nextSampleTime
+		}
+
 		if !s.muted.Load() && !s.disabled.Load() {
 			var opts *SampleWriteOptions
 			if isAudioProvider {
@@ -685,11 +699,26 @@ func (s *LocalTrack) writeWorker(provider SampleProvider, onComplete func()) {
 				}
 			}
 
-			sample.Timestamp = nextSampleTime
 			if err := s.WriteSample(sample, opts); err != nil {
 				s.log.Errorw("could not write sample", err)
 				return
 			}
+		}
+
+		if providerStamped {
+			// The source is real time and paces the reader itself, so send
+			// immediately. Sleeping here would turn any data already queued
+			// on the socket into a permanent delay. Keep nextSampleTime
+			// current in case later samples are unstamped.
+			now := time.Now()
+			nextSampleTime = now
+			if sample.Duration > 0 && now.Sub(lastLatencyLog) >= 5*time.Second {
+				lastLatencyLog = now
+				s.log.Debugw("sending capture-stamped sample",
+					"captureToSend", now.Sub(sample.Timestamp),
+				)
+			}
+			continue
 		}
 
 		// account for clock drift

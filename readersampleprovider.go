@@ -86,6 +86,23 @@ type ReaderSampleProvider struct {
 	// The parsed metadata is stashed and re-attached to the next frame.
 	pendingFrameMetadata *FrameMetadata
 
+	// When the packet trailer carries a user timestamp (Unix microseconds of
+	// the frame's capture time), samples are stamped with it and the track
+	// sends them as soon as they are read instead of pacing them by
+	// FrameDuration. A real-time source (camera over TCP) then paces the
+	// track itself, so any backlog on the socket (accumulated while the track
+	// was being negotiated, or during a stall) drains immediately instead of
+	// becoming a permanent delay, and RTP timestamps follow capture times.
+	paceOnUserTimestamp bool
+	// capture time of the last frame with metadata; also applied to the
+	// non-VCL NALs (SPS/PPS/AUD) that surround it.
+	lastCaptureTime time.Time
+	// capture time of the previous *frame*, to derive the frame's real
+	// duration: the track lower-bounds the RTP timestamp step by the sample
+	// duration, so a fixed duration would skew the timeline of a source that
+	// runs faster than 1/FrameDuration.
+	prevFrameCaptureTime time.Time
+
 	// Allow various types of ingress
 	reader io.ReadCloser
 
@@ -189,6 +206,16 @@ func ReaderTrackWithMaxNALSize(size int) func(provider *ReaderSampleProvider) {
 	}
 }
 
+// ReaderTrackWithUserTimestampPacing controls whether samples whose packet
+// trailer carries a user timestamp are stamped with that capture time and
+// sent as soon as they are read (default true when the packet trailer is
+// enabled). Disable it to fall back to fixed FrameDuration pacing.
+func ReaderTrackWithUserTimestampPacing(enabled bool) func(provider *ReaderSampleProvider) {
+	return func(provider *ReaderSampleProvider) {
+		provider.paceOnUserTimestamp = enabled
+	}
+}
+
 // NewLocalFileTrack creates an *os.File reader for NewLocalReaderTrack
 func NewLocalFileTrack(file string, options ...ReaderSampleProviderOption) (*LocalTrack, error) {
 	// File health check
@@ -259,6 +286,7 @@ func NewLocalReaderTrack(in io.ReadCloser, mime string, options ...ReaderSampleP
 		h26xStreamingFormat: H26xStreamingFormatAnnexB,
 		Mime:                mime,
 		reader:              in,
+		paceOnUserTimestamp: true,
 		// default audio level to be fairly loud
 		AudioLevel: 15,
 	}
@@ -382,6 +410,7 @@ func (p *ReaderSampleProvider) NextSample(ctx context.Context) (media.Sample, er
 			if p.appendPacketTrailer {
 				if meta, ok := parseH264SEIPacketTrailer(nalUnitData); ok {
 					p.pendingFrameMetadata = &meta
+					p.noteCaptureTime(meta)
 				}
 			}
 			// If SEI, clear the data and do not return a frame.
@@ -389,6 +418,7 @@ func (p *ReaderSampleProvider) NextSample(ctx context.Context) (media.Sample, er
 			// samples that can break some decoders.
 			sample.Data = nil
 			sample.Duration = 0
+			sample.Timestamp = p.lastCaptureTime
 			return sample, nil
 		}
 
@@ -403,6 +433,7 @@ func (p *ReaderSampleProvider) NextSample(ctx context.Context) (media.Sample, er
 		}
 
 		sample.Data = nalUnitData
+		sample.Timestamp = p.lastCaptureTime
 		if !isFrame {
 			// return it without duration
 			return sample, nil
@@ -458,12 +489,14 @@ func (p *ReaderSampleProvider) NextSample(ctx context.Context) (media.Sample, er
 				if p.appendPacketTrailer {
 					if meta, ok := parseH265SEIPacketTrailer(nal.Data); ok {
 						p.pendingFrameMetadata = &meta
+						p.noteCaptureTime(meta)
 					}
 				}
 				// If SEI and no frame yet, skip it unless we're only holding param sets.
 				if !haveVCL && len(sample.Data) == 0 {
 					sample.Data = nil
 					sample.Duration = 0
+					sample.Timestamp = p.lastCaptureTime
 					return sample, nil
 				}
 				continue
@@ -474,6 +507,7 @@ func (p *ReaderSampleProvider) NextSample(ctx context.Context) (media.Sample, er
 				if !haveVCL && len(sample.Data) == 0 {
 					sample.Data = nil
 					sample.Duration = 0
+					sample.Timestamp = p.lastCaptureTime
 					return sample, nil
 				}
 				continue
@@ -490,6 +524,7 @@ func (p *ReaderSampleProvider) NextSample(ctx context.Context) (media.Sample, er
 			// Append this NAL to the current access unit payload.
 			builder.Append(nal.Data)
 			sample.Data = builder.Bytes()
+			sample.Timestamp = p.lastCaptureTime
 
 			if nal.NalUnitType < 32 {
 				haveVCL = true
@@ -512,6 +547,7 @@ func (p *ReaderSampleProvider) NextSample(ctx context.Context) (media.Sample, er
 			sample.Data = appendPacketTrailer(sample.Data, *p.pendingFrameMetadata)
 			p.pendingFrameMetadata = nil
 		}
+		sample.Timestamp = p.lastCaptureTime
 
 		sample.Duration = defaultH265FrameDuration
 
@@ -554,6 +590,17 @@ func (p *ReaderSampleProvider) NextSample(ctx context.Context) (media.Sample, er
 
 	if p.FrameDuration > 0 {
 		sample.Duration = p.FrameDuration
+	}
+	if sample.Duration > 0 && !sample.Timestamp.IsZero() {
+		// Capture-stamped frame: use the real interval since the previous
+		// frame as its duration so the RTP timeline follows capture times
+		// exactly, whatever the source frame rate.
+		if !p.prevFrameCaptureTime.IsZero() {
+			if d := sample.Timestamp.Sub(p.prevFrameCaptureTime); d > 0 {
+				sample.Duration = d
+			}
+		}
+		p.prevFrameCaptureTime = sample.Timestamp
 	}
 	return sample, nil
 }
@@ -718,6 +765,15 @@ func (w *wavReader) readFrame() ([]byte, error) {
 
 	// Return the frame (may be partial if at end of data)
 	return buf[:n], nil
+}
+
+// noteCaptureTime records the capture time carried by a packet trailer so the
+// samples of that access unit are stamped with it (see paceOnUserTimestamp).
+func (p *ReaderSampleProvider) noteCaptureTime(meta FrameMetadata) {
+	if !p.paceOnUserTimestamp || meta.UserTimestamp == 0 {
+		return
+	}
+	p.lastCaptureTime = time.UnixMicro(int64(meta.UserTimestamp))
 }
 
 // defaultMaxNALSize bounds a single length-prefixed NAL when no limit is set
